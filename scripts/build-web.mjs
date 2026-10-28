@@ -17,9 +17,15 @@ const repo = process.env.FRONTEND_REPO || 'https://github.com/lLeonardoMarques/A
 const ref = process.env.FRONTEND_REF || 'main';
 const origemLocal = process.env.WEB_SOURCE;
 
-const run = (cmd, args, cwd) => {
+// `npm ci --include=dev` instala as ferramentas de build mesmo se o Render
+// definir NODE_ENV=production; o build em si roda SEMPRE com NODE_ENV=production
+// (senão o Vite gera o React em modo desenvolvimento, maior e mais lento).
+const run = (cmd, args, cwd, nodeEnv) => {
   console.log(`> ${cmd} ${args.join(' ')}`);
-  execFileSync(cmd, args, { cwd, stdio: 'inherit', env: { ...process.env, NODE_ENV: 'development' } });
+  const env = { ...process.env };
+  if (nodeEnv) env.NODE_ENV = nodeEnv;
+  else delete env.NODE_ENV;
+  execFileSync(cmd, args, { cwd, stdio: 'inherit', env });
 };
 
 fs.rmSync(destino, { recursive: true, force: true });
@@ -34,7 +40,7 @@ if (origemLocal) {
 }
 
 run('npm', ['ci', '--include=dev', '--no-audit', '--no-fund'], destino);
-run('npm', ['run', 'build'], destino);
+run('npm', ['run', 'build'], destino, 'production');
 
 if (!fs.existsSync(path.join(destino, 'dist', 'index.html'))) {
   throw new Error('Build do frontend não gerou dist/index.html');
