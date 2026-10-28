@@ -3,9 +3,12 @@ import express from 'express';
 import { MongoClient } from 'mongodb';
 import crypto from 'node:crypto';
 
-// =======================================
-// CONFIGURACOES E SEGURANCA
-// =======================================
+// =============================================
+// ANPRICE - BACKEND
+// Login, MongoDB, OAuth e Mercado Livre
+// =============================================
+
+// 1. VARIAVEIS DE AMBIENTE
 
 const required = [
   'MELI_CLIENT_ID',
@@ -20,22 +23,20 @@ const required = [
 const missing = required.filter(k => !process.env[k]);
 
 if (missing.length) {
-  throw new Error('Variaveis ausentes: ' + missing.join(', '));
-}
-
-const key = Buffer.from(
-  process.env.TOKEN_ENCRYPTION_KEY,
-  'hex'
-);
-
-if (
-  key.length !== 32 ||
-  !/^[a-f0-9]{64}$/i.test(process.env.TOKEN_ENCRYPTION_KEY)
-) {
   throw new Error(
-    'TOKEN_ENCRYPTION_KEY deve ter 64 caracteres hexadecimais'
+    'Variaveis ausentes: ' + missing.join(', ')
   );
 }
+
+const keyHex = process.env.TOKEN_ENCRYPTION_KEY;
+
+if (!/^[a-f0-9]{64}$/i.test(keyHex)) {
+  throw new Error(
+    'TOKEN_ENCRYPTION_KEY deve conter 64 caracteres hexadecimais'
+  );
+}
+
+const key = Buffer.from(keyHex, 'hex');
 
 if (process.env.ADMIN_PASSWORD.length < 16) {
   throw new Error(
@@ -43,11 +44,10 @@ if (process.env.ADMIN_PASSWORD.length < 16) {
   );
 }
 
-// =======================================
-// MONGODB
-// =======================================
+// 2. BANCO DE DADOS
 
 const mongo = new MongoClient(process.env.MONGO_URI);
+
 await mongo.connect();
 
 const db = mongo.db('anprice');
@@ -66,16 +66,16 @@ await sessions.createIndex(
   { expireAfterSeconds: 0 }
 );
 
-// =======================================
-// EXPRESS E CORS
-// =======================================
+// 3. EXPRESS E CORS
 
 const app = express();
 
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '4kb' }));
 
-const origin = new URL(process.env.FRONTEND_URL).origin;
+const origin = new URL(
+  process.env.FRONTEND_URL
+).origin;
 
 app.use((req, res, next) => {
   if (req.headers.origin === origin) {
@@ -98,12 +98,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// =======================================
-// FUNCOES DE SEGURANCA
-// =======================================
+// 4. SEGURANCA E CRIPTOGRAFIA
 
 const hash = s =>
-  crypto.createHash('sha256').update(s).digest('hex');
+  crypto
+    .createHash('sha256')
+    .update(s)
+    .digest('hex');
 
 const random = () =>
   crypto.randomBytes(32).toString('base64url');
@@ -126,7 +127,9 @@ function seal(obj) {
     iv,
     cipher.getAuthTag(),
     data
-  ].map(b => b.toString('base64url')).join('.');
+  ]
+    .map(b => b.toString('base64url'))
+    .join('.');
 }
 
 function unseal(value) {
@@ -151,16 +154,17 @@ function unseal(value) {
 }
 
 function sessionCookie(req) {
-  return (req.headers.cookie || '')
+  const cookie = (req.headers.cookie || '')
     .split(';')
     .map(x => x.trim())
-    .find(x => x.startsWith('anprice_session='))
-    ?.slice('anprice_session='.length);
+    .find(x => x.startsWith('anprice_session='));
+
+  return cookie?.slice(
+    'anprice_session='.length
+  );
 }
 
-// =======================================
-// AUTENTICACAO
-// =======================================
+// 5. AUTENTICACAO ADMINISTRATIVA
 
 async function auth(req, res, next) {
   try {
@@ -172,12 +176,12 @@ async function auth(req, res, next) {
       });
     }
 
-    const r = await sessions.findOne({
+    const result = await sessions.findOne({
       _id: hash(s),
       expires: { $gt: new Date() }
     });
 
-    if (!r) {
+    if (!result) {
       return res.status(401).json({
         erro: 'Sessão expirada.'
       });
@@ -194,19 +198,14 @@ async function auth(req, res, next) {
 const cookieFlags =
   'HttpOnly; Secure; SameSite=None; Path=/; Max-Age=28800';
 
-// =======================================
-// HEALTH
-// =======================================
+// 6. HEALTH CHECK
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// =======================================
-// LOGIN ADMINISTRADOR
-// =======================================
+// 7. LOGIN
 
-// Limitador simples para uma unica instancia.
 let attempts = [];
 
 app.post('/api/login', async (req, res, next) => {
@@ -227,15 +226,17 @@ app.post('/api/login', async (req, res, next) => {
 
     attempts.push(Date.now());
 
-    const a = Buffer.from(
+    const supplied = Buffer.from(
       String(req.body?.password || '')
     );
 
-    const b = Buffer.from(process.env.ADMIN_PASSWORD);
+    const expected = Buffer.from(
+      process.env.ADMIN_PASSWORD
+    );
 
     if (
-      a.length !== b.length ||
-      !crypto.timingSafeEqual(a, b)
+      supplied.length !== expected.length ||
+      !crypto.timingSafeEqual(supplied, expected)
     ) {
       return res.status(401).json({
         erro: 'Senha inválida.'
@@ -251,121 +252,128 @@ app.post('/api/login', async (req, res, next) => {
       )
     });
 
-    res
-      .set(
-        'Set-Cookie',
-        `anprice_session=${s}; ${cookieFlags}`
-      )
-      .json({ ok: true });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// =======================================
-// LOGOUT
-// =======================================
-
-app.post('/api/logout', auth, async (req, res, next) => {
-  try {
-    if (req.headers.origin !== origin) {
-      return res.sendStatus(403);
-    }
-
-    await sessions.deleteOne({
-      _id: hash(sessionCookie(req))
-    });
-
-    res
-      .set(
-        'Set-Cookie',
-        'anprice_session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0'
-      )
-      .json({ ok: true });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// =======================================
-// STATUS MERCADO LIVRE
-// =======================================
-
-app.get('/api/status', auth, async (req, res, next) => {
-  try {
-    const r = await tokens.findOne({
-      _id: 'principal'
-    });
-
-    res.json({
-      conectado: !!r
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// =======================================
-// INICIAR OAUTH MERCADO LIVRE
-// =======================================
-
-app.post('/api/auth/iniciar', auth, async (req, res, next) => {
-  try {
-    if (req.headers.origin !== origin) {
-      return res.sendStatus(403);
-    }
-
-    const state = random();
-    const verifier = random();
-
-    const challenge = crypto
-      .createHash('sha256')
-      .update(verifier)
-      .digest('base64url');
-
-    await states.insertOne({
-      _id: hash(state),
-      verifier: seal({ verifier }),
-      sessionHash: hash(sessionCookie(req)),
-      expires: new Date(Date.now() + 600000)
-    });
-
-    const u = new URL(
-      'https://auth.mercadolivre.com.br/authorization'
+    res.set(
+      'Set-Cookie',
+      `anprice_session=${s}; ${cookieFlags}`
     );
 
-    const params = {
-      response_type: 'code',
-      client_id: process.env.MELI_CLIENT_ID,
-      redirect_uri: process.env.MELI_REDIRECT_URI,
-      state,
-      code_challenge: challenge,
-      code_challenge_method: 'S256'
-    };
-
-    for (const [k, v] of Object.entries(params)) {
-      u.searchParams.set(k, v);
-    }
-
-    res.json({
-      url: u.toString()
-    });
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
 });
 
-// =======================================
-// TROCA E RENOVACAO DE TOKEN
-// =======================================
+// 8. LOGOUT
+
+app.post(
+  '/api/logout',
+  auth,
+  async (req, res, next) => {
+    try {
+      if (req.headers.origin !== origin) {
+        return res.sendStatus(403);
+      }
+
+      await sessions.deleteOne({
+        _id: hash(sessionCookie(req))
+      });
+
+      res.set(
+        'Set-Cookie',
+        'anprice_session=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0'
+      );
+
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// 9. STATUS DA CONEXAO MERCADO LIVRE
+
+app.get(
+  '/api/status',
+  auth,
+  async (req, res, next) => {
+    try {
+      const result = await tokens.findOne({
+        _id: 'principal'
+      });
+
+      res.json({
+        conectado: !!result
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// 10. INICIAR OAUTH
+
+app.post(
+  '/api/auth/iniciar',
+  auth,
+  async (req, res, next) => {
+    try {
+      if (req.headers.origin !== origin) {
+        return res.sendStatus(403);
+      }
+
+      const state = random();
+      const verifier = random();
+
+      const challenge = crypto
+        .createHash('sha256')
+        .update(verifier)
+        .digest('base64url');
+
+      await states.insertOne({
+        _id: hash(state),
+        verifier: seal({ verifier }),
+        sessionHash: hash(sessionCookie(req)),
+        expires: new Date(
+          Date.now() + 10 * 60 * 1000
+        )
+      });
+
+      const url = new URL(
+        'https://auth.mercadolivre.com.br/authorization'
+      );
+
+      const params = {
+        response_type: 'code',
+        client_id: process.env.MELI_CLIENT_ID,
+        redirect_uri: process.env.MELI_REDIRECT_URI,
+        state,
+        code_challenge: challenge,
+        code_challenge_method: 'S256'
+      };
+
+      for (const [k, v] of Object.entries(params)) {
+        url.searchParams.set(k, v);
+      }
+
+      res.json({
+        url: url.toString()
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// 11. OBTER OU RENOVAR TOKENS OAUTH
 
 async function oauth(params) {
-  const r = await fetch(
+  const resposta = await fetch(
     'https://api.mercadolibre.com/oauth/token',
     {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type':
+          'application/x-www-form-urlencoded',
         Accept: 'application/json'
       },
       body: new URLSearchParams({
@@ -377,11 +385,11 @@ async function oauth(params) {
     }
   );
 
-  if (!r.ok) {
-    throw new Error('oauth_' + r.status);
+  if (!resposta.ok) {
+    throw new Error('oauth_' + resposta.status);
   }
 
-  const t = await r.json();
+  const t = await resposta.json();
 
   if (
     !t.access_token ||
@@ -398,9 +406,7 @@ async function oauth(params) {
   };
 }
 
-// =======================================
-// CALLBACK MERCADO LIVRE
-// =======================================
+// 12. CALLBACK DO MERCADO LIVRE
 
 app.get(
   '/auth/mercadolivre/callback',
@@ -409,11 +415,16 @@ app.get(
     res.set('Cache-Control', 'no-store');
 
     try {
-      const state = String(req.query.state || '');
-      const code = String(req.query.code || '');
+      const state = String(
+        req.query.state || ''
+      );
+
+      const code = String(
+        req.query.code || ''
+      );
 
       if (!state || !code) {
-        throw Error('invalid');
+        throw new Error('invalid');
       }
 
       const result = await states.findOneAndDelete({
@@ -423,16 +434,18 @@ app.get(
       });
 
       if (!result) {
-        throw Error('state');
+        throw new Error('state');
       }
 
-      const verifier =
-        unseal(result.verifier).verifier;
+      const verifier = unseal(
+        result.verifier
+      ).verifier;
 
       const t = await oauth({
         grant_type: 'authorization_code',
         code,
-        redirect_uri: process.env.MELI_REDIRECT_URI,
+        redirect_uri:
+          process.env.MELI_REDIRECT_URI,
         code_verifier: verifier
       });
 
@@ -458,9 +471,7 @@ app.get(
   }
 );
 
-// =======================================
-// TOKEN ATUAL E REFRESH
-// =======================================
+// 13. TOKEN ATIVO
 
 let refreshInProgress = null;
 
@@ -470,13 +481,16 @@ async function token() {
   });
 
   if (!row) {
-    throw Error('not_connected');
+    throw new Error('not_connected');
   }
 
-  let t = unseal(row.data);
+  const currentToken = unseal(row.data);
 
-  if (Date.now() < t.expires_at - 60000) {
-    return t.access_token;
+  if (
+    Date.now() <
+    currentToken.expires_at - 60000
+  ) {
+    return currentToken.access_token;
   }
 
   if (!refreshInProgress) {
@@ -485,10 +499,15 @@ async function token() {
         _id: 'principal'
       });
 
+      if (!current) {
+        throw new Error('not_connected');
+      }
+
       let value = unseal(current.data);
 
       if (
-        Date.now() >= value.expires_at - 60000
+        Date.now() >=
+        value.expires_at - 60000
       ) {
         value = await oauth({
           grant_type: 'refresh_token',
@@ -497,7 +516,11 @@ async function token() {
 
         await tokens.updateOne(
           { _id: 'principal' },
-          { $set: { data: seal(value) } }
+          {
+            $set: {
+              data: seal(value)
+            }
+          }
         );
       }
 
@@ -510,136 +533,239 @@ async function token() {
   return refreshInProgress;
 }
 
-// =======================================
-// BUSCA MERCADO LIVRE
-// DIAGNOSTICO DE ERRO 403
-// =======================================
+// =============================================
+// 14. NOVA ROTA - DIAGNOSTICO DO TOKEN
+// =============================================
 
-app.get('/api/buscar', auth, async (req, res) => {
-  const q = String(req.query.q || '').trim();
+// Temporaria: remover apos o diagnostico.
+// Protegida pela mesma sessao de administrador.
+// Nao retorna nem registra o token.
 
-  if (q.length < 2 || q.length > 100) {
-    return res.status(400).json({
-      erro: 'Informe uma busca entre 2 e 100 caracteres.'
-    });
-  }
+app.get(
+  '/api/diagnostico/token',
+  auth,
+  async (req, res) => {
+    res.set('Cache-Control', 'no-store');
 
-  try {
-    const access = await token();
+    try {
+      const access = await token();
 
-    const u = new URL(
-      'https://api.mercadolibre.com/sites/MLB/search'
-    );
-
-    u.searchParams.set('q', q);
-    u.searchParams.set('limit', '20');
-
-    const r = await fetch(u, {
-      headers: {
-        Authorization: `Bearer ${access}`,
-        Accept: 'application/json'
-      },
-      signal: AbortSignal.timeout(15000)
-    });
-
-    if (!r.ok) {
-      // Novo diagnostico seguro:
-      // registra o status e codigos de erro,
-      // sem imprimir tokens ou cabecalhos de autorizacao.
-      let detail = {};
-
-      try {
-        const errorData = await r.json();
-
-        if (
-          errorData &&
-          typeof errorData === 'object'
-        ) {
-          detail = {
-            errorCode:
-              typeof errorData.error === 'string'
-                ? errorData.error.slice(0, 100)
-                : null,
-            causeCodes: Array.isArray(errorData.cause)
-              ? errorData.cause
-                  .slice(0, 5)
-                  .map(c =>
-                    typeof c?.code === 'string' ||
-                    typeof c?.code === 'number'
-                      ? String(c.code).slice(0, 80)
-                      : null
-                  )
-              : []
-          };
+      const resposta = await fetch(
+        'https://api.mercadolibre.com/users/me',
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${access}`,
+            Accept: 'application/json'
+          },
+          signal: AbortSignal.timeout(15000)
         }
-      } catch {
-        detail = { bodyFormat: 'non_json' };
-      }
+      );
 
-      console.error('[ANPRICE][MELI_SEARCH]', {
-        statusMercadoLivre: r.status,
-        ...detail
+      console.log('[ANPRICE][TOKEN_TEST]', {
+        status: resposta.status,
+        autorizado: resposta.ok
       });
 
-      return res.status(
-        r.status === 429 ? 429 : 502
+      res.json({
+        teste: 'users/me',
+        statusMercadoLivre: resposta.status,
+        autorizado: resposta.ok
+      });
+    } catch (err) {
+      const notConnected =
+        err?.message === 'not_connected';
+
+      console.error('[ANPRICE][TOKEN_TEST]', {
+        tipo: err?.name || 'UnknownError',
+        codigo: notConnected
+          ? 'NOT_CONNECTED'
+          : 'VALIDATION_ERROR'
+      });
+
+      res.status(
+        notConnected ? 409 : 503
       ).json({
+        erro: notConnected
+          ? 'Conecte o Mercado Livre primeiro.'
+          : 'Nao foi possivel validar o acesso.'
+      });
+    }
+  }
+);
+
+// =============================================
+// 15. BUSCA DE PRODUTOS MERCADO LIVRE
+// =============================================
+
+app.get(
+  '/api/buscar',
+  auth,
+  async (req, res) => {
+    const q = String(
+      req.query.q || ''
+    ).trim();
+
+    if (q.length < 2 || q.length > 100) {
+      return res.status(400).json({
         erro:
-          'Consulta ao Mercado Livre não autorizada ou indisponível.',
-        statusMercadoLivre: r.status,
-        observacao:
-          r.status === 403
-            ? 'A API recusou a pesquisa. Verifique as permissões e restrições da aplicação.'
-            : 'Verifique a disponibilidade da API do Mercado Livre.'
+          'Informe uma busca entre 2 e 100 caracteres.'
       });
     }
 
-    const data = await r.json();
+    try {
+      const access = await token();
 
-    res.json({
-      consulta: q,
-      consultadoEm: new Date().toISOString(),
-      resultados: data.results || [],
-      totalInformado: data.paging?.total ?? null
-    });
+      const url = new URL(
+        'https://api.mercadolibre.com/sites/MLB/search'
+      );
 
-  } catch (e) {
-    console.error('[ANPRICE][BUSCA_FALHOU]', {
-      tipo: e?.name || 'UnknownError',
-      codigo: e?.message === 'not_connected'
-        ? 'NOT_CONNECTED'
-        : 'UPSTREAM_OR_TOKEN_ERROR'
-    });
+      url.searchParams.set('q', q);
+      url.searchParams.set('limit', '20');
 
-    res.status(503).json({
-      erro: e.message === 'not_connected'
-        ? 'Conecte a conta do Mercado Livre primeiro.'
-        : 'Não foi possível consultar. Confira a conexão e autorização.'
-    });
+      const resposta = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${access}`,
+          Accept: 'application/json'
+        },
+        signal: AbortSignal.timeout(15000)
+      });
+
+      if (!resposta.ok) {
+        let detail = {};
+
+        try {
+          const errorData = await resposta.json();
+
+          if (
+            errorData &&
+            typeof errorData === 'object'
+          ) {
+            detail = {
+              errorCode:
+                typeof errorData.error === 'string'
+                  ? errorData.error.slice(0, 100)
+                  : null,
+
+              policyCode:
+                typeof errorData.code === 'string'
+                  ? errorData.code.slice(0, 100)
+                  : null,
+
+              blockedBy:
+                typeof errorData.blocked_by === 'string'
+                  ? errorData.blocked_by.slice(0, 100)
+                  : null,
+
+              causeCodes:
+                Array.isArray(errorData.cause)
+                  ? errorData.cause
+                      .slice(0, 5)
+                      .map(c =>
+                        c?.code != null
+                          ? String(c.code).slice(0, 80)
+                          : null
+                      )
+                  : []
+            };
+          }
+        } catch {
+          detail = {
+            bodyFormat: 'non_json'
+          };
+        }
+
+        console.error(
+          '[ANPRICE][MELI_SEARCH]',
+          {
+            statusMercadoLivre:
+              resposta.status,
+            ...detail
+          }
+        );
+
+        return res.status(
+          resposta.status === 429 ? 429 : 502
+        ).json({
+          erro:
+            'Consulta ao Mercado Livre não autorizada ou indisponível.',
+          statusMercadoLivre:
+            resposta.status,
+          observacao:
+            resposta.status === 403
+              ? 'A API recusou a consulta por uma politica de acesso ou autorizacao.'
+              : 'Verifique a disponibilidade e as permissoes da API.'
+        });
+      }
+
+      const data = await resposta.json();
+
+      res.json({
+        consulta: q,
+        consultadoEm:
+          new Date().toISOString(),
+        resultados: data.results || [],
+        totalInformado:
+          data.paging?.total ?? null
+      });
+
+    } catch (err) {
+      const notConnected =
+        err?.message === 'not_connected';
+
+      console.error(
+        '[ANPRICE][BUSCA_FALHOU]',
+        {
+          tipo:
+            err?.name || 'UnknownError',
+          codigo: notConnected
+            ? 'NOT_CONNECTED'
+            : 'UPSTREAM_OR_TOKEN_ERROR'
+        }
+      );
+
+      res.status(503).json({
+        erro: notConnected
+          ? 'Conecte a conta do Mercado Livre primeiro.'
+          : 'Não foi possível consultar. Confira a conexão e autorização.'
+      });
+    }
   }
-});
+);
 
-// =======================================
-// TRATAMENTO GLOBAL DE ERROS
-// =======================================
+// =============================================
+// 16. TRATAMENTO GLOBAL DE ERROS
+// =============================================
 
 app.use((err, req, res, next) => {
-  console.error('[ANPRICE][ERRO_INTERNO]', {
-    tipo: err?.name || 'UnknownError'
-  });
+  console.error(
+    '[ANPRICE][ERRO_INTERNO]',
+    {
+      tipo: err?.name || 'UnknownError'
+    }
+  );
 
   res.status(500).json({
     erro: 'Erro interno.'
   });
 });
 
-// =======================================
-// INICIAR SERVIDOR
-// =======================================
+// =============================================
+// 17. INICIAR SERVIDOR
+// =============================================
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(
+  process.env.PORT || 3000
+);
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('AnPrice API iniciada');
-  console.log('Frontend autorizado:', origin);
-});
+app.listen(
+  PORT,
+  '0.0.0.0',
+  () => {
+    console.log('AnPrice API iniciada');
+    console.log(
+      'Frontend autorizado:',
+      origin
+    );
+  }
+);
