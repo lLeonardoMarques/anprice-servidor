@@ -1,1 +1,18 @@
-{"name":"anprice-api","version":"1.0.0","private":true,"type":"module","engines":{"node":">=20"},"scripts":{"start":"node server.js"},"dependencies":{"express":"^5.1.0","mongodb":"^6.12.0"}}
+{
+  "name": "anprice-api",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm ci --omit=dev --no-audit --no-fund && node scripts/build-web.mjs",
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "mongodb": "^6.12.0"
+  }
+}
