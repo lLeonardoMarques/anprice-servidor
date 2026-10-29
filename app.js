@@ -12,7 +12,8 @@ import {
   HTTP_POR_CODIGO,
   createMeliClient,
   buscarProdutos,
-  diagnosticarEndpoints
+  diagnosticarEndpoints,
+  extrairReferencia
 } from './meli.js';
 
 const SESSAO_MS = 8 * 60 * 60 * 1000;
@@ -35,6 +36,8 @@ const MENSAGENS = {
   BANCO_INDISPONIVEL: 'Banco de dados indisponível no momento.',
   ERRO_INTERNO: 'Erro interno do servidor.',
   DIAGNOSTICO_DESATIVADO: 'Diagnóstico desativado neste servidor.',
+  REFERENCIA_INVALIDA:
+    'Link ou código não reconhecido. Use o link de um anúncio do Mercado Livre ou um código como MLB1234567890.',
   ML_NAO_CONECTADO: 'Conecte a conta do Mercado Livre primeiro.',
   ML_REAUTORIZAR: 'A autorização do Mercado Livre expirou ou foi revogada. Conecte a conta novamente.',
   ML_TOKEN_INVALIDO: 'O Mercado Livre recusou o token de acesso. Conecte a conta novamente.',
@@ -476,10 +479,13 @@ export function createApp({ db, config, fetchImpl = fetch, log = console }) {
   });
 
   app.get('/api/diagnostico/endpoints', auth, diagnostico, async (req, res, next) => {
+    const textoRef = String(req.query.ref || '').trim();
+    const ref = textoRef ? extrairReferencia(textoRef) : null;
+    if (textoRef && !ref) return erro(res, 400, 'REFERENCIA_INVALIDA');
     try {
-      const resultados = await diagnosticarEndpoints(meli);
+      const resultados = await diagnosticarEndpoints(meli, { ref });
       log.log('[ANPRICE][DIAGNOSTICO]', resultados.map(r => `${r.endpoint}=${r.status ?? '-'}:${r.codigo}`).join(' '));
-      res.json({ executadoEm: new Date().toISOString(), resultados });
+      res.json({ executadoEm: new Date().toISOString(), referencia: ref, resultados });
     } catch (err) {
       if (err instanceof MeliError) return responderMeliError(res, err);
       next(err);

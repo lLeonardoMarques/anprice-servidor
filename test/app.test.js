@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { iniciar, tokenOk, json, POLICY_403, SENHA } from './helpers.js';
+import { extrairReferencia } from '../meli.js';
 
 // Catálogo do Mercado Livre simulado com 2 produtos e ofertas.
 const catalogo = {
@@ -294,4 +295,60 @@ test('sem frontend compilado o servidor responde 503 explicativo', async t => {
   const r = await s.req('/');
   assert.equal(r.status, 503);
   assert.match(r.dados, /npm run build/);
+});
+
+test('extrairReferencia: links de produto, de anúncio e códigos', () => {
+  assert.deepEqual(
+    extrairReferencia('https://www.mercadolivre.com.br/perfume-dior-sauvage-edt-100ml/p/MLB15184521?pdp_filters=item_id:MLB3333'),
+    { tipo: 'produto', id: 'MLB15184521' }
+  );
+  assert.deepEqual(
+    extrairReferencia('https://produto.mercadolivre.com.br/MLB-4012345678-perfume-dior-_JM#position=1'),
+    { tipo: 'item', id: 'MLB4012345678' }
+  );
+  assert.deepEqual(extrairReferencia(' mlb4012345678 '), { tipo: 'indefinido', id: 'MLB4012345678' });
+  assert.equal(extrairReferencia('https://www.google.com'), null);
+  assert.equal(extrairReferencia(''), null);
+});
+
+test('diagnóstico com link de anúncio testa as consultas por ID mesmo com a busca bloqueada', async t => {
+  const s = await iniciar({
+    rotas: {
+      ...catalogo,
+      '/products/search': () => json(403, POLICY_403),
+      '/sites/MLB/domain_discovery': () => json(403, POLICY_403),
+      '/users/1/items/search': () => json(200, { results: [] }),
+      '/products/MLB111': () => json(200, { id: 'MLB111' }),
+      '/products/MLB15184521': () => json(200, { id: 'MLB15184521' }),
+      '/items/MLB4012345678/prices': () => json(403, POLICY_403),
+      '/items/MLB4012345678': () => json(200, { id: 'MLB4012345678', seller_id: 77, catalog_product_id: 'MLB111' })
+    }
+  });
+  t.after(s.close);
+  await s.login();
+  await s.conectar();
+
+  const ruim = await s.req('/api/diagnostico/endpoints?ref=' + encodeURIComponent('https://www.google.com'));
+  assert.equal(ruim.status, 400);
+  assert.equal(ruim.dados.codigo, 'REFERENCIA_INVALIDA');
+
+  const link = 'https://produto.mercadolivre.com.br/MLB-4012345678-perfume-dior-_JM';
+  const r = await s.req('/api/diagnostico/endpoints?ref=' + encodeURIComponent(link));
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.dados.referencia, { tipo: 'item', id: 'MLB4012345678' });
+  const mapa = Object.fromEntries(r.dados.resultados.map(x => [x.endpoint, x.codigo]));
+  assert.equal(mapa['/users/{id}/items/search (seus anúncios)'], 'OK');
+  assert.equal(mapa['/products/search'], 'ML_BLOQUEADO_POLITICA');
+  assert.equal(mapa['/items/{id}'], 'OK');
+  assert.equal(mapa['/items/{id}/prices'], 'ML_BLOQUEADO_POLITICA');
+  assert.equal(mapa['/products/{id}'], 'OK', 'produto de catálogo obtido a partir do anúncio');
+  assert.equal(mapa['/products/{id}/items'], 'OK');
+  assert.equal(mapa['/users/{id}'], 'OK');
+  assert.ok(!Object.values(mapa).includes('NAO_TESTADO'));
+
+  // Código ambíguo que não é anúncio → testado como produto de catálogo.
+  const r2 = await s.req('/api/diagnostico/endpoints?ref=MLB15184521');
+  assert.deepEqual(r2.dados.referencia, { tipo: 'indefinido', id: 'MLB15184521' });
+  const mapa2 = Object.fromEntries(r2.dados.resultados.map(x => [x.endpoint, x.codigo]));
+  assert.equal(mapa2['/products/{id}'], 'OK');
 });

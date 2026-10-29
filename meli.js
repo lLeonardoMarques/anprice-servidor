@@ -372,13 +372,39 @@ async function buscarNoSite(client, q, site, tentativas, erroCatalogo) {
   }
 }
 
+// Extrai o ID de um link ou código de anúncio do Mercado Livre.
+//   https://www.mercadolivre.com.br/.../p/MLB12345678      → produto de catálogo
+//   https://produto.mercadolivre.com.br/MLB-1234567890-... → anúncio (item)
+//   MLB1234567890                                          → indefinido (testa item, depois produto)
+export function extrairReferencia(valor) {
+  const s = String(valor || '').trim();
+  if (!s || s.length > 1000) return null;
+  const produto = s.match(/\/p\/(MLB\d{5,15})(?![\d])/i);
+  if (produto) return { tipo: 'produto', id: produto[1].toUpperCase() };
+  const item = s.match(/(?:^|[^A-Za-z0-9])MLB-?(\d{6,15})(?![\d])/i);
+  if (item) return { tipo: /^https?:\/\//i.test(s) ? 'item' : 'indefinido', id: 'MLB' + item[1] };
+  return null;
+}
+
+const naoTestado = endpoint => ({ endpoint, codigo: 'NAO_TESTADO' });
+
 // Bateria de testes de acesso. Devolve apenas status e códigos.
-export async function diagnosticarEndpoints(client, site = 'MLB') {
+// `ref` (opcional) é o resultado de extrairReferencia: permite testar as
+// consultas por ID mesmo quando todas as buscas estão bloqueadas.
+export async function diagnosticarEndpoints(client, { site = 'MLB', ref = null } = {}) {
   const termo = 'celular';
   const resultado = [];
 
   const me = await client.sondar('/users/me', '/users/me');
   resultado.push(me);
+
+  const meId = me.data?.id;
+  const PROPRIOS = '/users/{id}/items/search (seus anúncios)';
+  resultado.push(
+    meId != null
+      ? await client.sondar(`/users/${encodeURIComponent(meId)}/items/search?limit=1`, PROPRIOS)
+      : naoTestado(PROPRIOS)
+  );
 
   resultado.push(
     await client.sondar(`/sites/${site}/search?q=${termo}&limit=1`, '/sites/{site}/search?q=')
@@ -397,9 +423,26 @@ export async function diagnosticarEndpoints(client, site = 'MLB') {
   );
   resultado.push(catalogo);
 
-  const produtoId = catalogo.data?.results?.[0]?.id;
   let itemId = null;
   let sellerId = null;
+  let itemSonda = null;
+  let produtoDoItem = null;
+
+  // Referência informada como anúncio (ou código ambíguo): testa /items/{id} primeiro.
+  let produtoRef = ref?.tipo === 'produto' ? ref.id : null;
+  if (ref && ref.tipo !== 'produto') {
+    const s = await client.sondar(`/items/${encodeURIComponent(ref.id)}`, '/items/{id}');
+    if (ref.tipo === 'indefinido' && s.codigo === 'ML_NAO_ENCONTRADO') {
+      produtoRef = ref.id;
+    } else {
+      itemSonda = s;
+      itemId = ref.id;
+      sellerId = s.data?.seller_id ?? null;
+      produtoDoItem = s.data?.catalog_product_id || null;
+    }
+  }
+
+  const produtoId = produtoRef || produtoDoItem || catalogo.data?.results?.[0]?.id || null;
 
   if (produtoId) {
     const pid = encodeURIComponent(produtoId);
@@ -407,28 +450,30 @@ export async function diagnosticarEndpoints(client, site = 'MLB') {
     resultado.push(produto);
     const itens = await client.sondar(`/products/${pid}/items?limit=1`, '/products/{id}/items');
     resultado.push(itens);
-    const primeira = itens.data?.results?.[0] || produto.data?.buy_box_winner;
-    itemId = primeira?.item_id || null;
-    sellerId = primeira?.seller_id || null;
+    if (!itemId) {
+      const primeira = itens.data?.results?.[0] || produto.data?.buy_box_winner;
+      itemId = primeira?.item_id || null;
+      sellerId = primeira?.seller_id || null;
+    }
   } else {
-    resultado.push({ endpoint: '/products/{id}', codigo: 'NAO_TESTADO' });
-    resultado.push({ endpoint: '/products/{id}/items', codigo: 'NAO_TESTADO' });
+    resultado.push(naoTestado('/products/{id}'));
+    resultado.push(naoTestado('/products/{id}/items'));
   }
 
   if (itemId) {
     const iid = encodeURIComponent(itemId);
-    resultado.push(await client.sondar(`/items/${iid}`, '/items/{id}'));
+    resultado.push(itemSonda || (await client.sondar(`/items/${iid}`, '/items/{id}')));
     resultado.push(await client.sondar(`/items/${iid}/prices`, '/items/{id}/prices'));
   } else {
-    resultado.push({ endpoint: '/items/{id}', codigo: 'NAO_TESTADO' });
-    resultado.push({ endpoint: '/items/{id}/prices', codigo: 'NAO_TESTADO' });
+    resultado.push(naoTestado('/items/{id}'));
+    resultado.push(naoTestado('/items/{id}/prices'));
   }
 
-  if (sellerId) {
-    resultado.push(await client.sondar(`/users/${encodeURIComponent(sellerId)}`, '/users/{id}'));
-  } else {
-    resultado.push({ endpoint: '/users/{id}', codigo: 'NAO_TESTADO' });
-  }
+  resultado.push(
+    sellerId != null
+      ? await client.sondar(`/users/${encodeURIComponent(sellerId)}`, '/users/{id}')
+      : naoTestado('/users/{id}')
+  );
 
   // Remove os corpos das respostas: só status e códigos saem daqui.
   return resultado.map(({ data, ...r }) => ({
